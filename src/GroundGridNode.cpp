@@ -38,6 +38,9 @@ namespace groundgrid
         GroundGridNode(const rclcpp::NodeOptions &options) : Node("groundgrid_node", options),
                                                              mTfBuffer_(this->get_clock()), mTfListener_(mTfBuffer_)
         {
+	    this->declare_parameter("z_threshold", 1000.0);
+	    z_threshold = this->get_parameter("z_threshold").as_double();
+
             groundgrid_ = std::make_shared<GroundGrid>();
             ground_segmentation_.init(groundgrid_->mDimension, groundgrid_->mResolution);
 
@@ -134,6 +137,10 @@ namespace groundgrid
 
                 for (const auto &point : cloud->points)
                 {
+	 	    // TODO needs to be tested
+		    if (point.z > z_threshold)
+		        continue;
+
                     psIn.point.x = point.x;
                     psIn.point.y = point.y;
                     psIn.point.z = point.z;
@@ -311,6 +318,8 @@ namespace groundgrid
         tf2_ros::TransformListener mTfListener_;
 
         geometry_msgs::msg::TransformStamped mapToBaseTransform_, cloudOriginTransform_;
+
+	double z_threshold;
     };
 }
 

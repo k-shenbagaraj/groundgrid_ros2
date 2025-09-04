@@ -8,6 +8,7 @@ def generate_launch_description():
     namespace = LaunchConfiguration('namespace')
     container_name = LaunchConfiguration('container_name', default='/ouster/os_container')
     pointcloud_topic = LaunchConfiguration('pointcloud_topic', default='ouster/points')
+    z_threshold = LaunchConfiguration("z_threshold", default=1000.0)
 
     declare_namespace_arg = DeclareLaunchArgument(
         'namespace',
@@ -25,6 +26,12 @@ def generate_launch_description():
         default_value=pointcloud_topic,
         description='Pointcloud topic name'
     )
+    declare_z_threshold_arg = DeclareLaunchArgument(
+        "z_threshold",
+        default_value="1000.0",
+        description="filter points above this height"
+    )
+
 
     load_composable_nodes = LoadComposableNodes(
         target_container=[namespace, container_name],
@@ -36,7 +43,8 @@ def generate_launch_description():
                 namespace=namespace,
                 remappings=[
                     ('/sensors/velodyne_points', pointcloud_topic)
-                ]
+                ],
+                parameters=[{"z_threshold": z_threshold}]
             )
         ]
     )
@@ -45,5 +53,6 @@ def generate_launch_description():
         declare_namespace_arg,
         declare_pointcloud_topic_arg,
         declare_container_name_arg,
+        declare_z_threshold_arg,
         load_composable_nodes,
     ])
