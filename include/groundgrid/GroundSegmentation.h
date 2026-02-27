@@ -28,6 +28,7 @@ class GroundSegmentation {
     void insert_cloud(const pcl::PointCloud<PCLPoint>::Ptr cloud, const size_t start, const size_t end, const PCLPoint& cloudOrigin, std::vector<std::pair<size_t, grid_map::Index> >& point_index, std::vector<std::pair<size_t, grid_map::Index> >& ignored, std::vector<size_t>& outliers, grid_map::GridMap &map);
     void detect_ground_patches(grid_map::GridMap &map, unsigned short section) const;
     template<int S> void detect_ground_patch(grid_map::GridMap &map, size_t i, size_t j) const;
+    void update_hole_cost_layer(grid_map::GridMap &map) const;
     void spiral_ground_interpolation(grid_map::GridMap &map, const geometry_msgs::msg::TransformStamped &toBase) const;
     void interpolate_cell(grid_map::GridMap &map, const size_t x, const size_t y) const;
 

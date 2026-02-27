@@ -20,7 +20,7 @@ void GroundGrid::initGroundGrid(const nav_msgs::msg::Odometry::SharedPtr inOdom)
 
     geometry_msgs::msg::PoseWithCovarianceStamped odomPose;
 
-    mMap_ptr = std::make_shared<grid_map::GridMap>(std::vector<std::string>{"points", "ground", "groundpatch", "minGroundHeight", "maxGroundHeight"});
+    mMap_ptr = std::make_shared<grid_map::GridMap>(std::vector<std::string>{"points", "ground", "groundpatch", "minGroundHeight", "maxGroundHeight", "signed_height_residual", "hole_persistence", "hole_cost"});
     grid_map::GridMap &map = *mMap_ptr;
     map.setFrameId("odom");
     map.setGeometry(grid_map::Length(mDimension, mDimension), mResolution,
@@ -40,6 +40,9 @@ void GroundGrid::initGroundGrid(const nav_msgs::msg::Odometry::SharedPtr inOdom)
     map["groundpatch"].setConstant(0.0000001);
     map["minGroundHeight"].setConstant(100.0);
     map["maxGroundHeight"].setConstant(-100.0);
+    map["signed_height_residual"].setZero();
+    map["hole_persistence"].setZero();
+    map["hole_cost"].setZero();
 
     std::chrono::_V2::steady_clock::time_point end = std::chrono::steady_clock::now();
     RCLCPP_DEBUG(rclcpp::get_logger("groundgrid"), "Transforms lookup took %ld ms",
@@ -91,6 +94,9 @@ std::shared_ptr<grid_map::GridMap> GroundGrid::update(
             tf2::doTransform(ps, ps, base_to_map_transform);
             map.at("ground", idx) = -ps.point.z;
             map.at("groundpatch", idx) = 0.0;
+            map.at("signed_height_residual", idx) = 0.0;
+            map.at("hole_persistence", idx) = 0.0;
+            map.at("hole_cost", idx) = 0.0;
         }
     }
 

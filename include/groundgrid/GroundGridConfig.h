@@ -16,6 +16,15 @@ struct GroundGridConfig
     double occupied_cells_decrease_factor = 5.0;
     double occupied_cells_point_count_factor = 20.0;
     double min_outlier_detection_ground_confidence = 1.25;
+    double hole_negative_residual_threshold = 0.20;
+    double hole_cost_sigma = 0.10;
+    double hole_persistence_increase = 0.25;
+    double hole_persistence_decay = 0.10;
+    double hole_no_observation_decay = 0.02;
+    double interpolation_height_sigma = 0.20;
+    double interpolation_slope_sigma = 0.35;
+    double interpolation_anisotropic_direction_factor = 1.5;
+    double interpolation_min_confidence = 0.01;
     int thread_count = 8;
 };
 

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <thread>
 #include <cmath>
+#include <array>
 
 using namespace groundgrid;
 
@@ -123,6 +124,7 @@ pcl::PointCloud<GroundSegmentation::PCLPoint>::Ptr GroundSegmentation::filter_cl
                 std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
 
     start = std::chrono::steady_clock::now();
+    update_hole_cost_layer(map);
     map["points"].setConstant(0.0);
 
     // Re-add ignored points
@@ -372,6 +374,66 @@ void GroundSegmentation::detect_ground_patch(grid_map::GridMap& map, size_t i, s
     RCLCPP_DEBUG(rclcpp::get_logger("GroundSegmentation"), "Updated patch at (%zu, %zu), ground height: %f, confidence: %f", i, j, oldGroundheight, oldConfidence);
 }
 
+void GroundSegmentation::update_hole_cost_layer(grid_map::GridMap &map) const
+{
+    map.add("signed_height_residual", 0.0);
+    map.add("hole_persistence", 0.0);
+    map.add("hole_cost", 0.0);
+
+    grid_map::Matrix &residual = map["signed_height_residual"];
+    grid_map::Matrix &persistence = map["hole_persistence"];
+    grid_map::Matrix &hole_cost = map["hole_cost"];
+
+    const grid_map::Matrix &min_height = map["minGroundHeight"];
+    const grid_map::Matrix &ground = map["ground"];
+    const grid_map::Matrix &points = map["points"];
+
+    const float strong_negative_threshold = -static_cast<float>(mConfig.hole_negative_residual_threshold);
+    const float sigma = std::max(static_cast<float>(mConfig.hole_cost_sigma), 1e-4f);
+    const float persistence_increase = static_cast<float>(mConfig.hole_persistence_increase);
+    const float persistence_decay = static_cast<float>(mConfig.hole_persistence_decay);
+    const float no_observation_decay = static_cast<float>(mConfig.hole_no_observation_decay);
+    const auto residual_to_cost = [sigma](const float residual_delta) {
+        const float exponent = std::clamp(residual_delta / sigma, -40.0f, 40.0f);
+        return 1.0f / (1.0f + std::exp(exponent));
+    };
+
+    for (grid_map::GridMapIterator iterator(map); !iterator.isPastEnd(); ++iterator)
+    {
+        const grid_map::Index index(*iterator);
+        const int i = index(0);
+        const int j = index(1);
+
+        float &residual_cell = residual(i, j);
+        float &persistence_cell = persistence(i, j);
+        float &hole_cost_cell = hole_cost(i, j);
+
+        if (points(i, j) <= 0.0f)
+        {
+            persistence_cell = std::max(0.0f, persistence_cell - no_observation_decay);
+            const float raw_cost = residual_to_cost(residual_cell);
+            hole_cost_cell = persistence_cell * raw_cost;
+            continue;
+        }
+
+        const float delta = min_height(i, j) - ground(i, j);
+        residual_cell = delta;
+
+        if (delta <= strong_negative_threshold)
+        {
+            persistence_cell = std::min(1.0f, persistence_cell + persistence_increase);
+        }
+        else
+        {
+            persistence_cell = std::max(0.0f, persistence_cell - persistence_decay);
+        }
+
+        // Sigmoid(-delta / sigma): large negative residuals map to high obstacle cost.
+        const float raw_cost = residual_to_cost(delta);
+        hole_cost_cell = persistence_cell * raw_cost;
+    }
+}
+
 void GroundSegmentation::spiral_ground_interpolation(grid_map::GridMap &map, const geometry_msgs::msg::TransformStamped &toBase) const
 {
     static grid_map::Matrix& ggl = map["ground"];
@@ -430,19 +492,182 @@ void GroundSegmentation::spiral_ground_interpolation(grid_map::GridMap &map, con
 void GroundSegmentation::interpolate_cell(grid_map::GridMap &map, const size_t x, const size_t y) const
 {
     static const auto& center_idx = map.getSize()(0)/2 - 1;
-    static const size_t blocksize = 3;
-    // "groundpatch" layer contains confidence values
     static grid_map::Matrix& gvl = map["groundpatch"];
-    // "ground" contains the ground height values
     static grid_map::Matrix& ggl = map["ground"];
-    const auto& gvlblock = gvl.block<blocksize, blocksize>(x - blocksize / 2, y - blocksize / 2);
+    constexpr float min_weight = 1e-6f;
+    constexpr float min_gradient = 1e-4f;
+    const int xi = static_cast<int>(x);
+    const int yi = static_cast<int>(y);
+    const float resolution = map.getResolution();
 
     float& height = ggl(x, y);
     float& occupied = gvl(x, y);
-    const float& gvlSum = gvlblock.sum() + std::numeric_limits<float>::min(); // avoid division by 0
-    const float avg = (gvlblock.cwiseProduct(ggl.block<blocksize, blocksize>(x - blocksize / 2, y - blocksize / 2))).sum() / gvlSum;
 
-    height = (1.0f - occupied) * avg + occupied * height;
+    const float min_confidence = std::max(static_cast<float>(mConfig.interpolation_min_confidence), 0.0f);
+    const float sigma_height = std::max(static_cast<float>(mConfig.interpolation_height_sigma), 1e-4f);
+    const float sigma_slope = std::max(static_cast<float>(mConfig.interpolation_slope_sigma), 1e-4f);
+    const float anisotropic_factor = std::max(static_cast<float>(mConfig.interpolation_anisotropic_direction_factor), 0.0f);
+    const float spatial_sigma = std::max(1.5f * resolution, 1e-4f);
+
+    struct NeighborSample
+    {
+        int dx;
+        int dy;
+        float sample_height;
+        float sample_confidence;
+        float distance;
+        float spatial_weight;
+    };
+    std::array<NeighborSample, 8> neighbors;
+    size_t neighbor_count = 0;
+
+    float seed_num = 0.0f;
+    float seed_den = 0.0f;
+
+    for (int dy = -1; dy <= 1; ++dy)
+    {
+        for (int dx = -1; dx <= 1; ++dx)
+        {
+            if (dx == 0 && dy == 0)
+                continue;
+
+            const int nx = xi + dx;
+            const int ny = yi + dy;
+            const float sample_confidence = gvl(nx, ny);
+            const float sample_height = ggl(nx, ny);
+
+            if (!std::isfinite(sample_confidence) || !std::isfinite(sample_height) || sample_confidence < min_confidence)
+                continue;
+
+            const float distance = std::hypot(static_cast<float>(dx), static_cast<float>(dy)) * resolution;
+            const float spatial_weight = std::exp(-0.5f * (distance * distance) / (spatial_sigma * spatial_sigma));
+            neighbors[neighbor_count++] = {dx, dy, sample_height, sample_confidence, distance, spatial_weight};
+
+            const float base_weight = sample_confidence * spatial_weight;
+            seed_num += base_weight * sample_height;
+            seed_den += base_weight;
+        }
+    }
+
+    if (neighbor_count > 0)
+    {
+        const float center_seed = seed_den > min_weight ? seed_num / seed_den : height;
+
+        auto read_sample = [&](const int ox, const int oy, float& sample_height, float& sample_confidence) {
+            sample_height = ggl(xi + ox, yi + oy);
+            sample_confidence = gvl(xi + ox, yi + oy);
+            return std::isfinite(sample_height) && std::isfinite(sample_confidence) && sample_confidence >= min_confidence;
+        };
+
+        float grad_x_num = 0.0f;
+        float grad_x_den = 0.0f;
+        for (int oy = -1; oy <= 1; ++oy)
+        {
+            float east_height = 0.0f, east_conf = 0.0f;
+            float west_height = 0.0f, west_conf = 0.0f;
+            const bool has_east = read_sample(1, oy, east_height, east_conf);
+            const bool has_west = read_sample(-1, oy, west_height, west_conf);
+
+            if (has_east && has_west)
+            {
+                const float pair_confidence = 0.5f * (east_conf + west_conf);
+                grad_x_num += pair_confidence * (east_height - west_height) / (2.0f * resolution);
+                grad_x_den += pair_confidence;
+            }
+            else if (has_east)
+            {
+                const float pair_confidence = 0.5f * east_conf;
+                grad_x_num += pair_confidence * (east_height - center_seed) / resolution;
+                grad_x_den += pair_confidence;
+            }
+            else if (has_west)
+            {
+                const float pair_confidence = 0.5f * west_conf;
+                grad_x_num += pair_confidence * (center_seed - west_height) / resolution;
+                grad_x_den += pair_confidence;
+            }
+        }
+
+        float grad_y_num = 0.0f;
+        float grad_y_den = 0.0f;
+        for (int ox = -1; ox <= 1; ++ox)
+        {
+            float north_height = 0.0f, north_conf = 0.0f;
+            float south_height = 0.0f, south_conf = 0.0f;
+            const bool has_north = read_sample(ox, 1, north_height, north_conf);
+            const bool has_south = read_sample(ox, -1, south_height, south_conf);
+
+            if (has_north && has_south)
+            {
+                const float pair_confidence = 0.5f * (north_conf + south_conf);
+                grad_y_num += pair_confidence * (north_height - south_height) / (2.0f * resolution);
+                grad_y_den += pair_confidence;
+            }
+            else if (has_north)
+            {
+                const float pair_confidence = 0.5f * north_conf;
+                grad_y_num += pair_confidence * (north_height - center_seed) / resolution;
+                grad_y_den += pair_confidence;
+            }
+            else if (has_south)
+            {
+                const float pair_confidence = 0.5f * south_conf;
+                grad_y_num += pair_confidence * (center_seed - south_height) / resolution;
+                grad_y_den += pair_confidence;
+            }
+        }
+
+        const float grad_x = grad_x_den > min_weight ? grad_x_num / grad_x_den : 0.0f;
+        const float grad_y = grad_y_den > min_weight ? grad_y_num / grad_y_den : 0.0f;
+        const float grad_mag = std::hypot(grad_x, grad_y);
+
+        float normal_x = 0.0f;
+        float normal_y = 0.0f;
+        float tangent_x = 0.0f;
+        float tangent_y = 0.0f;
+        if (grad_mag > min_gradient)
+        {
+            normal_x = grad_x / grad_mag;
+            normal_y = grad_y / grad_mag;
+            tangent_x = -normal_y;
+            tangent_y = normal_x;
+        }
+
+        float weighted_height_sum = 0.0f;
+        float total_weight = 0.0f;
+
+        for (size_t i = 0; i < neighbor_count; ++i)
+        {
+            const NeighborSample& n = neighbors[i];
+            const float offset_x = static_cast<float>(n.dx) * resolution;
+            const float offset_y = static_cast<float>(n.dy) * resolution;
+            const float predicted_height = center_seed + grad_x * offset_x + grad_y * offset_y;
+            const float height_error = std::abs(n.sample_height - predicted_height);
+            const float slope_error = height_error / std::max(n.distance, 1e-4f);
+
+            const float normalized_height_error = height_error / sigma_height;
+            const float normalized_slope_error = slope_error / sigma_slope;
+            const float height_weight = std::exp(-0.5f * normalized_height_error * normalized_height_error);
+            const float slope_weight = std::exp(-0.5f * normalized_slope_error * normalized_slope_error);
+
+            float directional_weight = 1.0f;
+            if (grad_mag > min_gradient && n.distance > 1e-4f)
+            {
+                const float dir_x = offset_x / n.distance;
+                const float dir_y = offset_y / n.distance;
+                const float across_gradient = std::abs(dir_x * normal_x + dir_y * normal_y);
+                const float along_slope = std::abs(dir_x * tangent_x + dir_y * tangent_y);
+                directional_weight = std::exp(-anisotropic_factor * grad_mag * across_gradient) * (0.5f + 0.5f * along_slope);
+            }
+
+            const float weight = n.sample_confidence * n.spatial_weight * height_weight * slope_weight * directional_weight;
+            weighted_height_sum += weight * n.sample_height;
+            total_weight += weight;
+        }
+
+        const float interpolated_height = total_weight > min_weight ? weighted_height_sum / total_weight : center_seed;
+        height = (1.0f - occupied) * interpolated_height + occupied * height;
+    }
 
     // Only update confidence in cells above min distance
     if ((std::pow(static_cast<float>(x) - center_idx, 2.0) + std::pow(static_cast<float>(y) - center_idx, 2.0)) * std::pow(map.getResolution(), 2.0f) > minDistSquared)
